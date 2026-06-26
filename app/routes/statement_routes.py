@@ -9,7 +9,8 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.service.statement_service import StatementParser
-from app.service.account_statement_service import reconcile_transactions
+from app.service.account_statement_service import reconcile_bank_and_upi, reconcile_transactions
+from app.service.upi_statement_service import UPIStatementService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -44,7 +45,8 @@ def safe_float(value):
 @router.post("/upload")
 async def upload_statement(
     file: UploadFile = File(...),
-    accounting_json: str = Form(...)
+    accounting_json: str = Form(...),
+    upi_file: UploadFile | None = File(None)
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
@@ -55,13 +57,25 @@ async def upload_statement(
         raise HTTPException(status_code=400, detail=f"Unsupported file type '{ext}'.")
 
     file_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{ext}")
+    upi_file_path = None
 
     try:
-        # ---------------- SAVE FILE ----------------
+        # ---------------- SAVE BANK FILE ----------------
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         await file.close()
+
+        # ---------------- SAVE UPI FILE IF PROVIDED ----------------
+        if upi_file is not None and getattr(upi_file, "filename", None):
+            upi_ext = os.path.splitext(upi_file.filename)[1].lower()
+            if upi_ext not in ALLOWED_EXTENSIONS:
+                raise HTTPException(status_code=400, detail=f"Unsupported UPI file type '{upi_ext}'.")
+
+            upi_file_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}{upi_ext}")
+            with open(upi_file_path, "wb") as buffer:
+                shutil.copyfileobj(upi_file.file, buffer)
+            await upi_file.close()
 
         # ---------------- PARSE BANK STATEMENT ----------------
         result = StatementParser.extract_transactions(file_path)
@@ -72,6 +86,15 @@ async def upload_statement(
             tx["debit"] = safe_float(tx.get("debit"))
             tx["credit"] = safe_float(tx.get("credit"))
             valid_transactions.append(tx)
+
+        # ---------------- PARSE UPI STATEMENT ----------------
+        upi_transactions = []
+        upi_error = None
+        if upi_file_path:
+            upi_result = UPIStatementService.extract_transactions(upi_file_path)
+            upi_transactions = upi_result.get("transactions", [])
+            if not upi_result.get("success"):
+                upi_error = upi_result.get("error")
 
         # ---------------- PARSE ACCOUNTING JSON ----------------
         try:
@@ -86,9 +109,14 @@ async def upload_statement(
             if isinstance(accounting_payload, list)
             else []
         )
-        print(f"Received accounting records for reconciliation. - statement_routes.py:89", valid_transactions)
+        print(f"Received accounting records for reconciliation. - statement_routes.py:112", valid_transactions)
         # ---------------- RECONCILIATION ----------------
         reconciliation = reconcile_transactions(valid_transactions, accounting_data)
+        bank_upi_reconciliation = reconcile_bank_and_upi(
+            valid_transactions,
+            upi_transactions,
+            accounting_data
+        )
 
         # ---------------- COUNTS ----------------
         matched_count = sum(1 for x in reconciliation if x["matched"])
@@ -123,9 +151,14 @@ async def upload_statement(
             "filename": file.filename,
             "total_records": len(valid_transactions),
 
-            "detected_columns": result.get("schema", {}),
+            "detected_columns": result.get("detected_columns", result.get("schema", {})),
 
             "transactions": valid_transactions,
+            "upi_file": upi_file.filename if upi_file is not None and getattr(upi_file, "filename", None) else None,
+            "upi_transactions": upi_transactions,
+            "upi_error": upi_error,
+            "missing_data": bank_upi_reconciliation.get("upi_missing_in_bank", []),
+            "remarks": bank_upi_reconciliation.get("remarks", []),
 
             "reconciliation": {
                 "matched_count": matched_count,
@@ -140,7 +173,8 @@ async def upload_statement(
                 "missing_capital_count": missing_capital_count,
 
                 "items": reconciliation
-            }
+            },
+            "bank_upi_reconciliation": bank_upi_reconciliation
         })
 
     except Exception as e:
@@ -149,3 +183,5 @@ async def upload_statement(
 
     finally:
         _safe_remove(file_path)
+        if upi_file_path:
+            _safe_remove(upi_file_path)

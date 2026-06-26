@@ -6,17 +6,116 @@ import numpy as np
 class StatementParser:
 
     ROLE_ALIASES = {
-        "date": ["date", "tran date", "transaction date", "value date", "posting date"],
-        "description": ["narration", "particulars", "description", "details", "transaction", "remarks", "description (narration)"],
-        "debit": ["debit", "dr", "withdrawal", "withdrawals", "paid out", "withdraw", "debit (withdrawal)", "debit (withdrawal) ₹"],
-        "credit": ["credit", "cr", "deposit", "deposits", "received", "deposit amount", "credit (deposit)", "credit (deposit) ₹"],
-        "balance": ["balance", "closing balance", "bal", "available balance", "running balance", "balance ₹"],
-        "reference": ["chq", "cheque", "ref", "reference", "utr", "txn id", "trn id"],
-    }
+    "date": [
+        "date",
+        "tran date",
+        "transaction date",
+        "value date",
+        "posting date",
+    ],
+
+    "description": [
+        "narration",
+        "particular",
+        "particulars",
+        "description",
+        "details",
+        "transaction",
+        "remarks",
+        "description (narration)",
+    ],
+
+    "party_customer_vendor": [
+        "party/vendor",
+        "party",
+        "vendor",
+        "customer",
+        "customer/vendor",
+        "party name",
+        "vendor name",
+        "customer name",
+        "party customer vendor",
+    ],
+
+    "debit": [
+        "debit",
+        "dr",
+        "withdrawal",
+        "withdrawals",
+        "paid out",
+        "withdraw",
+        "debit (withdrawal)",
+        "debit (withdrawal) ₹",
+        "debit (₹)",
+    ],
+
+    "credit": [
+        "credit",
+        "cr",
+        "deposit",
+        "deposits",
+        "received",
+        "deposit amount",
+        "credit (deposit)",
+        "credit (deposit) ₹",
+        "credit (₹)",
+    ],
+
+    "balance": [
+        "balance",
+        "closing balance",
+        "bal",
+        "available balance",
+        "running balance",
+        "balance ₹",
+        "balance (₹)",
+    ],
+
+    "reference": [
+        "chq",
+        "cheque",
+        "ref",
+        "ref no",
+        "reference",
+        "reference no",
+        "utr",
+        "txn id",
+        "transaction id",
+        "trn id",
+    ],
+
+    "type": [
+        "type",
+        "transaction type",
+    ],
+
+    "category": [
+        "category",
+        "account category",
+    ],
+}
 
     # =========================
     # MAIN PIPELINE
     # =========================
+    @staticmethod
+    def _normalize_header(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    @classmethod
+    def _looks_like_party_header(cls, header):
+        normalized = cls._normalize_header(header)
+        if any(alias in normalized for alias in ["party", "vendor", "customer"]):
+            if any(alias in normalized for alias in ["description", "narration", "particular", "details", "remarks", "transaction"]):
+                return False
+            return True
+        return False
+
+    @classmethod
+    def _looks_like_description_header(cls, header):
+        normalized = cls._normalize_header(header)
+        return any(alias in normalized for alias in ["description", "narration", "particular", "details", "remarks", "transaction"])
+
     @classmethod
     def extract_transactions(cls, file_path):
 
@@ -95,10 +194,10 @@ class StatementParser:
             
             # Check for your specific header pattern
             if ("date" in text and 
-                "description" in text and 
-                "debit" in text and 
-                "credit" in text and 
-                "balance" in text):
+                ("description" in text or "particular" in text or "party" in text or "vendor" in text) and 
+                ("debit" in text or "withdrawal" in text) and 
+                ("credit" in text or "deposit" in text) and 
+                ("balance" in text or "balance ₹" in text)):
                 return i
         return None
 
@@ -113,10 +212,10 @@ class StatementParser:
             
             # Look for specific column names
             if ("date" in row_text and 
-                ("description" in row_text or "narration" in row_text) and
+                ("description" in row_text or "narration" in row_text or "particular" in row_text or "party" in row_text or "vendor" in row_text) and
                 ("debit" in row_text or "withdrawal" in row_text) and
                 ("credit" in row_text or "deposit" in row_text) and
-                ("balance" in row_text)):
+                ("balance" in row_text or "balance ₹" in row_text)):
                 return i
         return None
 
@@ -130,19 +229,31 @@ class StatementParser:
         for idx, header in enumerate(headers):
             header_lower = str(header).lower().strip()
             
-            # Exact match for your column names
-            if "date" in header_lower:
+            # Match the common bank statement column names
+            if "date" in header_lower and "date" not in mapping:
                 mapping["date"] = header
-            elif "description" in header_lower or "narration" in header_lower:
+            elif "reference" in header_lower or "ref" in header_lower or "utr" in header_lower or "txn" in header_lower:
+                if "reference" not in mapping:
+                    mapping["reference"] = header
+            elif "type" in header_lower:
+                if "type" not in mapping:
+                    mapping["type"] = header
+            elif "category" in header_lower:
+                if "category" not in mapping:
+                    mapping["category"] = header
+            elif cls._looks_like_party_header(header) and "party_customer_vendor" not in mapping:
+                mapping["party_customer_vendor"] = header
+            elif cls._looks_like_description_header(header) and "description" not in mapping:
                 mapping["description"] = header
             elif "debit" in header_lower or "withdrawal" in header_lower:
-                mapping["debit"] = header
+                if "debit" not in mapping:
+                    mapping["debit"] = header
             elif "credit" in header_lower or "deposit" in header_lower:
-                mapping["credit"] = header
+                if "credit" not in mapping:
+                    mapping["credit"] = header
             elif "balance" in header_lower:
-                mapping["balance"] = header
-            elif "reference" in header_lower or "ref" in header_lower or "utr" in header_lower:
-                mapping["reference"] = header
+                if "balance" not in mapping:
+                    mapping["balance"] = header
         
         return mapping
 
@@ -161,8 +272,13 @@ class StatementParser:
                 mapping["date"] = header
                 continue
             
+            # Check if column contains party/vendor/customer names
+            if cls._looks_like_party_header(header):
+                mapping["party_customer_vendor"] = header
+                continue
+
             # Check if column contains descriptions
-            if any(word in header_lower for word in ["description", "narration", "particulars", "details"]):
+            if cls._looks_like_description_header(header):
                 mapping["description"] = header
                 continue
             
@@ -220,23 +336,20 @@ class StatementParser:
     def _extract_rows(cls, df, mapping):
         rows = []
         
-        # Ensure all required columns exist
-        required = ["date", "description", "debit", "credit"]
+        # Ensure essential columns exist.
+        required = ["date", "debit", "credit"]
         for req in required:
             if req not in mapping:
-                # Try to find by common names
                 for col in df.columns:
                     col_lower = str(col).lower()
                     if req == "date" and "date" in col_lower:
-                        mapping[req] = col
-                    elif req == "description" and any(word in col_lower for word in ["description", "narration", "particulars"]):
                         mapping[req] = col
                     elif req == "debit" and any(word in col_lower for word in ["debit", "withdrawal"]):
                         mapping[req] = col
                     elif req == "credit" and any(word in col_lower for word in ["credit", "deposit"]):
                         mapping[req] = col
         
-        # If still missing required columns, return empty
+        # We can still extract rows if date/debit/credit are present even without a description column.
         if not all(req in mapping for req in required):
             return rows
         
@@ -245,15 +358,18 @@ class StatementParser:
             try:
                 date = str(row.get(mapping.get("date", ""), "")).strip()
                 description = str(row.get(mapping.get("description", ""), "")).strip()
+                party_customer_vendor = str(row.get(mapping.get("party_customer_vendor", ""), "")).strip()
                 
                 # Parse amounts - IMPORTANT: these are the columns with amounts
                 debit_str = str(row.get(mapping.get("debit", ""), "")).strip()
                 credit_str = str(row.get(mapping.get("credit", ""), "")).strip()
                 balance_str = str(row.get(mapping.get("balance", ""), "")).strip()
                 reference = str(row.get(mapping.get("reference", ""), "")).strip()
+                type_value = str(row.get(mapping.get("type", ""), "")).strip()
+                category_value = str(row.get(mapping.get("category", ""), "")).strip()
                 
                 # Skip if no data
-                if not description and not debit_str and not credit_str:
+                if not description and not party_customer_vendor and not debit_str and not credit_str:
                     continue
                 
                 # Parse amounts
@@ -274,10 +390,13 @@ class StatementParser:
                 rows.append({
                     "date": date,
                     "description": description,
+                    "party_customer_vendor": party_customer_vendor,
                     "debit": debit,
                     "credit": credit,
                     "balance": balance_str,
-                    "reference": reference
+                    "reference": reference,
+                    "type": type_value,
+                    "category": category_value
                 })
             except Exception as e:
                 # Skip problematic rows
