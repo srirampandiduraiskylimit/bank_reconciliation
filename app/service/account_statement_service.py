@@ -185,9 +185,10 @@ def _find_accounting_match(upi_tx: Dict[str, Any], accounting_data: Optional[Lis
 
     upi_amount = safe_float(upi_tx.get("amount", 0))
     upi_date = normalize_date(upi_tx.get("date"))
-    upi_description = _normalize_text(upi_tx.get("description", ""))
+    upi_description = _normalize_text(upi_tx.get("description", "") or upi_tx.get("notes", "") or "")
     upi_party = _normalize_text(upi_tx.get("party_customer_vendor") or upi_tx.get("upi_id") or "")
     upi_ref = str(upi_tx.get("transaction_id", "") or "")
+    upi_notes = str(upi_tx.get("notes", "") or "")
 
     best_match: Optional[Dict[str, Any]] = None
     best_score = 0.0
@@ -199,61 +200,94 @@ def _find_accounting_match(upi_tx: Dict[str, Any], accounting_data: Optional[Lis
             continue
 
         amount = normalized_item["income"] or normalized_item["expense"] or normalized_item["loan_capital"]
-        if round(amount, 2) != round(upi_amount, 2):
+        if abs(amount - upi_amount) > 0.01:
             continue
 
         item_date = normalized_item["date"]
         date_match = bool(not upi_date or not item_date or upi_date == item_date)
         if not date_match:
-            continue
+            try:
+                from datetime import datetime, timedelta
+                upi_dt = datetime.strptime(upi_date, "%Y-%m-%d")
+                item_dt = datetime.strptime(item_date, "%Y-%m-%d")
+                if abs((upi_dt - item_dt).days) <= 1:
+                    date_match = True
+            except:
+                pass
+            if not date_match:
+                continue
 
         ref_no = str(normalized_item.get("ref_no", "") or "")
         party = normalized_item.get("party_customer_vendor", "")
         description = normalized_item.get("particular", "")
 
         score = 0.0
-        if ref_no and upi_ref and ref_no.lower() == upi_ref.lower():
-            score = max(score, 0.95)
-        if party and upi_party and _normalize_text(party) == upi_party:
-            score = max(score, 0.9)
+        
+        if ref_no:
+            if ref_no.lower() in upi_notes.lower():
+                score += 0.5
+            if ref_no.lower() in upi_description.lower():
+                score += 0.3
+        
+        if party and upi_party:
+            if _normalize_text(party) == upi_party:
+                score += 0.3
+            elif _normalize_text(party) in upi_party or upi_party in _normalize_text(party):
+                score += 0.2
 
         desc_score = _description_similarity(upi_description, _normalize_text(description), upi_party, _normalize_text(party), upi_ref, ref_no)
-        score = max(score, desc_score)
+        score += desc_score * 0.3
 
-        if score >= best_score:
+        if score >= best_score and score >= 0.3:
             best_score = score
             best_match = item
 
-    if best_match is not None:
-        return best_match
-
-    return None
+    return best_match
 
 
 def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transactions: List[Dict[str, Any]], accounting_data: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """
-    Compare bank statement transactions with UPI statement transactions.
-    Returns matched items, non-UPI bank transactions, UPI exceptions, and remarks.
-    """
     matched: List[Dict[str, Any]] = []
     upi_missing_in_bank: List[Dict[str, Any]] = []
     bank_non_upi_transactions: List[Dict[str, Any]] = []
     bank_upi_transactions_without_match: List[Dict[str, Any]] = []
     used_upi_indexes: set[int] = set()
-
+    
+    accounting_lookup = {}
+    if accounting_data:
+        for item in accounting_data:
+            ref_no = str(item.get("ref_no", "")).strip()
+            if ref_no:
+                accounting_lookup[ref_no] = {
+                    "invoice_id": item.get("invoice_id"),
+                    "expense_id": item.get("expense_id"),
+                    "capital_id": item.get("capital_id"),
+                    "type": str(item.get("type", "")).strip().lower(),
+                    "particular": item.get("particular", ""),
+                    "party_customer_vendor": item.get("party_customer_vendor", ""),
+                    "payment_mode": item.get("payment_mode", ""),
+                    "amount": safe_float(item.get("income") or item.get("expense") or item.get("loan_capital") or 0)
+                }
+    
     for bank_tx in bank_transactions:
         bank_date = normalize_date(bank_tx.get("date"))
         bank_amount = 0.0
         if safe_float(bank_tx.get("debit", 0)) > 0:
             bank_amount = safe_float(bank_tx.get("debit", 0))
+            bank_type = "debit"
         elif safe_float(bank_tx.get("credit", 0)) > 0:
             bank_amount = safe_float(bank_tx.get("credit", 0))
+            bank_type = "credit"
+        else:
+            continue
 
         if bank_amount <= 0:
             continue
 
         matched_upi: Optional[Dict[str, Any]] = None
         matched_upi_idx: Optional[int] = None
+        best_match_score = 0.0
+        best_match_reason = ""
+        
         bank_description = _normalize_text(bank_tx.get("description", ""))
         bank_party = _normalize_text(bank_tx.get("party_customer_vendor") or bank_tx.get("party") or bank_tx.get("vendor") or bank_tx.get("customer") or "")
         bank_ref = str(bank_tx.get("reference", "") or "")
@@ -264,38 +298,103 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
 
             upi_amount = safe_float(upi_tx.get("amount", 0))
             upi_date = normalize_date(upi_tx.get("date"))
-            upi_description = _normalize_text(upi_tx.get("description", ""))
+            upi_description = _normalize_text(upi_tx.get("description", "") or upi_tx.get("notes", "") or "")
             upi_party = _normalize_text(upi_tx.get("party_customer_vendor") or upi_tx.get("upi_id") or "")
             upi_ref = str(upi_tx.get("transaction_id", "") or "")
+            upi_type = str(upi_tx.get("type", "")).strip().lower()
+            upi_notes = str(upi_tx.get("notes", "") or "").lower()
 
-            if upi_amount <= 0 or bank_amount <= 0:
+            if upi_amount <= 0:
                 continue
 
-            amount_match = round(upi_amount, 2) == round(bank_amount, 2)
-            if not amount_match:
+            if abs(upi_amount - bank_amount) > 0.01:
                 continue
 
+            date_match = False
             if bank_date and upi_date:
-                date_match = bank_date == upi_date
+                from datetime import datetime, timedelta
+                try:
+                    bank_dt = datetime.strptime(bank_date, "%Y-%m-%d")
+                    upi_dt = datetime.strptime(upi_date, "%Y-%m-%d")
+                    date_diff = abs((bank_dt - upi_dt).days)
+                    if date_diff <= 1:
+                        date_match = True
+                except:
+                    if bank_date == upi_date:
+                        date_match = True
             else:
                 date_match = True
 
             if not date_match:
                 continue
 
-            if not _is_transaction_type_match(bank_tx, upi_tx):
+            type_match = False
+            if bank_type == "debit" and ("debit" in upi_type or "dr" in upi_type):
+                type_match = True
+            elif bank_type == "credit" and ("credit" in upi_type or "cr" in upi_type):
+                type_match = True
+            
+            if not type_match:
                 continue
 
-            description_score = _description_similarity(bank_description, upi_description, bank_party, upi_party, bank_ref, upi_ref)
-            if description_score < 0.3 and not (bank_description and upi_description):
-                pass
+            score = 0.0
+            match_reasons = []
+            
+            if bank_ref:
+                bank_ref_lower = bank_ref.lower()
+                if bank_ref_lower in upi_notes:
+                    score += 0.6
+                    match_reasons.append("Reference in notes")
+                elif bank_ref_lower in upi_description:
+                    score += 0.4
+                    match_reasons.append("Reference in description")
+            
+            for acc_ref, acc_data in accounting_lookup.items():
+                if acc_ref.lower() in upi_notes:
+                    if abs(acc_data.get("amount", 0) - bank_amount) <= 0.01:
+                        score += 0.5
+                        match_reasons.append(f"Accounting reference {acc_ref} in notes")
+                        accounting_ids = acc_data
+                        break
+            
+            if bank_party and upi_party:
+                if bank_party == upi_party:
+                    score += 0.3
+                    match_reasons.append("Party exact match")
+                elif bank_party in upi_party or upi_party in bank_party:
+                    score += 0.2
+                    match_reasons.append("Party partial match")
+            
+            if bank_party and bank_party in upi_notes:
+                score += 0.2
+                match_reasons.append("Party in notes")
+            
+            if bank_description and upi_description:
+                desc_score = _description_similarity(bank_description, upi_description, bank_party, upi_party, bank_ref, upi_ref)
+                score += desc_score * 0.3
+                if desc_score > 0.5:
+                    match_reasons.append("Description match")
 
-            matched_upi = upi_tx
-            matched_upi_idx = idx
-            break
+            if score > best_match_score and score >= 0.3:
+                best_match_score = score
+                matched_upi = upi_tx
+                matched_upi_idx = idx
+                best_match_reason = ", ".join(match_reasons) if match_reasons else "Amount and date match"
 
         if matched_upi is not None and matched_upi_idx is not None:
             used_upi_indexes.add(matched_upi_idx)
+            
+            accounting_ids = {}
+            upi_notes = str(matched_upi.get("notes", "") or "").lower()
+            for acc_ref, acc_data in accounting_lookup.items():
+                if acc_ref.lower() in upi_notes:
+                    if abs(acc_data.get("amount", 0) - bank_amount) <= 0.01:
+                        accounting_ids = acc_data
+                        break
+            
+            if not accounting_ids and bank_ref in accounting_lookup:
+                accounting_ids = accounting_lookup[bank_ref]
+            
             matched.append({
                 "source": "bank",
                 "date": bank_date,
@@ -304,9 +403,21 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
                 "amount": bank_amount,
                 "matched_with_upi": True,
                 "upi_reference": matched_upi.get("transaction_id") or matched_upi.get("upi_id") or "",
-                "remarks": "Matched with UPI transaction"
+                "upi_party": matched_upi.get("description") or matched_upi.get("party_customer_vendor") or "",
+                "match_score": round(best_match_score, 2),
+                "match_reason": best_match_reason,
+                "invoice_id": accounting_ids.get("invoice_id"),
+                "expense_id": accounting_ids.get("expense_id"),
+                "capital_id": accounting_ids.get("capital_id"),
+                "status": "UPI Matched"
             })
         else:
+            is_upi_like = _looks_like_upi_transaction(bank_tx)
+            
+            accounting_ids = {}
+            if bank_ref in accounting_lookup:
+                accounting_ids = accounting_lookup[bank_ref]
+            
             non_upi_entry = {
                 "source": "bank",
                 "date": bank_date,
@@ -314,10 +425,15 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
                 "party_customer_vendor": bank_tx.get("party_customer_vendor") or bank_tx.get("party") or bank_tx.get("vendor") or bank_tx.get("customer") or "",
                 "amount": bank_amount,
                 "matched_with_upi": False,
-                "remarks": "No matching UPI transaction found; treated as a non-UPI bank transaction"
+                "invoice_id": accounting_ids.get("invoice_id"),
+                "expense_id": accounting_ids.get("expense_id"),
+                "capital_id": accounting_ids.get("capital_id"),
+                "status": "Non-UPI Transaction",
+                "remarks": "No matching UPI transaction found"
             }
             bank_non_upi_transactions.append(non_upi_entry)
-            if _looks_like_upi_transaction(bank_tx):
+            
+            if is_upi_like:
                 bank_upi_transactions_without_match.append(non_upi_entry)
 
     for idx, upi_tx in enumerate(upi_transactions):
@@ -329,27 +445,43 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
             continue
 
         accounting_match = _find_accounting_match(upi_tx, accounting_data) if accounting_data else None
+        
+        accounting_ids = {}
         if accounting_match:
-            upi_missing_in_bank.append({
-                "source": "accounting_upi",
-                "date": normalize_date(upi_tx.get("date")),
-                "description": upi_tx.get("description", ""),
-                "party_customer_vendor": upi_tx.get("party_customer_vendor") or upi_tx.get("upi_id") or "",
-                "amount": upi_amount,
-                "matched_with_upi": False,
+            accounting_ids = {
+                "invoice_id": accounting_match.get("invoice_id"),
+                "expense_id": accounting_match.get("expense_id"),
+                "capital_id": accounting_match.get("capital_id"),
+                "ref_no": accounting_match.get("ref_no")
+            }
+        else:
+            upi_notes = str(upi_tx.get("notes", "") or "")
+            import re
+            ref_match = re.search(r'(EXP-\d+|INV-\d+|CAP-\d+)', upi_notes)
+            if ref_match and ref_match.group(1) in accounting_lookup:
+                accounting_ids = accounting_lookup[ref_match.group(1)]
+        
+        upi_entry = {
+            "source": "accounting_upi" if accounting_match else "upi",
+            "date": normalize_date(upi_tx.get("date")),
+            "description": upi_tx.get("description", "") or upi_tx.get("notes", ""),
+            "party_customer_vendor": upi_tx.get("party_customer_vendor") or upi_tx.get("upi_id") or "",
+            "amount": upi_amount,
+            "matched_with_upi": False,
+            "invoice_id": accounting_ids.get("invoice_id"),
+            "expense_id": accounting_ids.get("expense_id"),
+            "capital_id": accounting_ids.get("capital_id"),
+            "status": "UPI Pending",
+            "reason": "No matching bank statement entry found"
+        }
+        
+        if accounting_match:
+            upi_entry.update({
                 "accounting_entry": _normalize_accounting_entry(accounting_match),
                 "reason": "Present in accounting and UPI but missing in bank statement"
             })
-        else:
-            upi_missing_in_bank.append({
-                "source": "upi",
-                "date": normalize_date(upi_tx.get("date")),
-                "description": upi_tx.get("description", ""),
-                "party_customer_vendor": upi_tx.get("party_customer_vendor") or upi_tx.get("upi_id") or "",
-                "amount": upi_amount,
-                "matched_with_upi": False,
-                "reason": "No matching bank statement entry found"
-            })
+            
+        upi_missing_in_bank.append(upi_entry)
 
     remarks: List[str] = []
     if not bank_transactions:
@@ -358,11 +490,11 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
         remarks.append("No UPI transactions were parsed from the provided UPI statement.")
 
     if matched:
-        remarks.append(f"{len(matched)} bank/UPI transaction(s) were matched.")
+        remarks.append(f"{len(matched)} bank/UPI transactions were matched.")
     if upi_missing_in_bank:
-        remarks.append(f"{len(upi_missing_in_bank)} UPI transaction(s) are missing from the bank statement.")
+        remarks.append(f"{len(upi_missing_in_bank)} UPI transactions are missing from the bank statement.")
     if bank_non_upi_transactions:
-        remarks.append(f"{len(bank_non_upi_transactions)} bank transaction(s) were treated as non-UPI transactions.")
+        remarks.append(f"{len(bank_non_upi_transactions)} bank transactions were treated as non-UPI transactions.")
     if not matched and not upi_missing_in_bank and not bank_non_upi_transactions:
         remarks.append("Bank and UPI statements are fully aligned for the parsed data.")
 
@@ -377,11 +509,7 @@ def reconcile_bank_and_upi(bank_transactions: List[Dict[str, Any]], upi_transact
         "bank_upi_transactions_without_match": bank_upi_transactions_without_match,
         "missing_count": len(upi_missing_in_bank),
         "missing_data": upi_missing_in_bank,
-        "remarks": remarks,
-        "statistics": {
-            "matched_count": len(matched),
-            "unmatched_count": len(upi_missing_in_bank) + len(bank_non_upi_transactions),
-        },
+        "remarks": remarks
     }
 
 
@@ -398,30 +526,39 @@ def _extract_accounting_id(item: Dict[str, Any], item_type: str) -> Optional[Any
     return item.get("id") or item.get("_id")
 
 
-def reconcile_transactions(bank_transactions, accounts_data):
+def reconcile_transactions(bank_transactions, accounts_data, upi_transactions=None):
     """
-    Reconcile bank transactions with accounting records.
+    Reconcile bank transactions with accounting records and UPI transactions.
     
-    Args:
-        bank_transactions: List of bank statement transactions
-        accounts_data: List of accounting entries (invoices, expenses, capital)
-    
-    Returns:
-        List of reconciliation results
+    Matching Logic:
+    1. PRIMARY: Date + Amount must match
+    2. SECONDARY: Transaction type (debit/credit) must match
     """
     result = []
-
-    # Create lookups for accounting entries by date+amount and amount-only for fallback matching
+    
     account_lookup = {}
     amount_lookup = {}
     used_accounting_indices = set()
+    upi_amount_date_lookup = {}
+    
+    if upi_transactions:
+        for upi_tx in upi_transactions:
+            upi_amount = safe_float(upi_tx.get("amount", 0))
+            upi_date = normalize_date(upi_tx.get("date"))
+            upi_date_only = upi_date.split()[0] if upi_date else ""
+            key = f"{upi_date_only}_{upi_amount:.2f}"
+            if key not in upi_amount_date_lookup:
+                upi_amount_date_lookup[key] = []
+            upi_amount_date_lookup[key].append(upi_tx)
+    
+    all_accounting_entries = []
     
     for idx, item in enumerate(accounts_data):
         item_date = normalize_date(item.get("date"))
         item_ref = str(item.get("ref_no", "")).strip()
         item_type = str(item.get("type", "")).strip().lower()
+        payment_mode = str(item.get("payment_mode", "")).strip().lower()
         
-        # Determine the amount based on type
         if item_type == "invoice":
             amount = safe_float(item.get("income"))
         elif item_type == "expense":
@@ -433,36 +570,39 @@ def reconcile_transactions(bank_transactions, accounts_data):
                 item.get("amount")
             )
         else:
-            continue  # Skip unknown types
+            continue
             
-        # Create key for lookup
         key = f"{item_date}_{amount:.2f}"
         if key not in account_lookup:
             account_lookup[key] = []
         
-        account_lookup[key].append({
+        entry_data = {
             "ref_no": item_ref,
             "type": item_type,
             "amount": amount,
             "date": item_date,
+            "payment_mode": payment_mode,
             "original": item,
-            "index": idx
-        })
+            "index": idx,
+            "ids": {
+                "invoice_id": item.get("invoice_id"),
+                "expense_id": item.get("expense_id"),
+                "capital_id": item.get("capital_id")
+            },
+            "matched": False,
+            "upi_matched": False,
+            "bank_matched": False
+        }
+        
+        account_lookup[key].append(entry_data)
 
         amount_key = f"{amount:.2f}"
         if amount_key not in amount_lookup:
             amount_lookup[amount_key] = []
 
-        amount_lookup[amount_key].append({
-            "ref_no": item_ref,
-            "type": item_type,
-            "amount": amount,
-            "date": item_date,
-            "original": item,
-            "index": idx
-        })
-
-    # Process each bank transaction
+        amount_lookup[amount_key].append(entry_data)
+        all_accounting_entries.append(entry_data)
+    
     for tx in bank_transactions:
         tx_date = normalize_date(tx.get("date"))
         debit = safe_float(tx.get("debit", 0))
@@ -479,24 +619,6 @@ def reconcile_transactions(bank_transactions, accounts_data):
             amount = credit
             is_credit = True
         else:
-            # Skip zero amount transactions
-            result.append({
-                "date": tx_date,
-                "description": tx.get("description", ""),
-                "amount": 0,
-                "matched": False,
-                "match_type": None,
-                "matched_ref_no": None,
-                "add_invoice": False,
-                "add_expense": False,
-                "add_capital": False,
-                "capital_id": None,
-                "invoice_id": None,
-                "expense_id": None,
-                "missing_transaction": True,
-                "action": "missing_transaction",
-                "reason": "Zero amount transaction - skipped"
-            })
             continue
 
         matched = False
@@ -509,7 +631,6 @@ def reconcile_transactions(bank_transactions, accounts_data):
             "expense_id": None,
         }
 
-        # Look for matching accounting entry by date and amount, with amount-only fallback
         lookup_key = f"{tx_date}_{amount:.2f}"
         candidates = []
         
@@ -520,68 +641,148 @@ def reconcile_transactions(bank_transactions, accounts_data):
             candidates = amount_lookup.get(amount_key, [])
         
         if candidates:
-            # Find the best match based on transaction type and avoid reusing the same accounting record
             for candidate in candidates:
                 candidate_type = candidate["type"]
                 candidate_idx = candidate["index"]
+                
                 if candidate_idx in used_accounting_indices:
                     continue
                 
-                # For credit transactions, match with invoices or capital
+                type_match = False
                 if is_credit and candidate_type in ["invoice", "capital"]:
-                    matched = True
-                    match_type = candidate_type
-                    matched_ref = candidate["ref_no"]
-                    matched_item = candidate["original"]
-                    if candidate_type == "invoice":
-                        matched_ids["invoice_id"] = _extract_accounting_id(matched_item, candidate_type)
-                    elif candidate_type == "expense":
-                        matched_ids["expense_id"] = _extract_accounting_id(matched_item, candidate_type)
-                    elif candidate_type == "capital":
-                        matched_ids["capital_id"] = _extract_accounting_id(matched_item, candidate_type)
-                    used_accounting_indices.add(candidate_idx)
-                    break
-                
-                # For debit transactions, match with expenses
+                    type_match = True
                 elif is_debit and candidate_type == "expense":
-                    matched = True
-                    match_type = "expense"
-                    matched_ref = candidate["ref_no"]
-                    matched_item = candidate["original"]
-                    matched_ids["expense_id"] = _extract_accounting_id(matched_item, candidate_type)
-                    used_accounting_indices.add(candidate_idx)
-                    break
+                    type_match = True
+                elif is_debit and candidate_type == "capital":
+                    type_match = True
+                
+                if not type_match:
+                    continue
+                
+                matched = True
+                match_type = candidate_type
+                matched_ref = candidate["ref_no"]
+                matched_item = candidate["original"]
+                matched_ids = candidate["ids"].copy()
+                used_accounting_indices.add(candidate_idx)
+                candidate["bank_matched"] = True
+                candidate["matched"] = True
+                break
 
-        # Create result entry
+        upi_match = None
+        if upi_transactions:
+            tx_date_only = tx_date.split()[0] if tx_date else ""
+            upi_key = f"{tx_date_only}_{amount:.2f}"
+            if upi_key in upi_amount_date_lookup:
+                for upi_tx in upi_amount_date_lookup[upi_key]:
+                    upi_type = str(upi_tx.get("type", "")).strip().lower()
+                    if (is_debit and "debit" in upi_type) or (is_credit and "credit" in upi_type):
+                        upi_match = upi_tx
+                        break
+
+        add_invoice = False
+        add_expense = False
+        add_capital = False
+        action = "none"
+        status = "Reconciled" if matched else "Pending Review"
+        
+        if not matched:
+            if is_credit:
+                add_invoice = True
+                action = "add_invoice"
+                status = "Pending Review"
+            elif is_debit:
+                add_expense = True
+                action = "add_expense"
+                status = "Pending Review"
+
         result_entry = {
             "date": tx_date,
             "description": tx.get("description", ""),
+            "party_customer_vendor": tx.get("party_customer_vendor") or tx.get("party") or tx.get("vendor") or tx.get("customer") or "",
             "amount": amount,
+            "type": "debit" if is_debit else "credit",
             "matched": matched,
             "match_type": match_type,
             "matched_ref_no": matched_ref,
-            "add_invoice": False,
-            "add_expense": False,
-            "add_capital": False,
-            "capital_id": matched_ids["capital_id"],
-            "invoice_id": matched_ids["invoice_id"],
-            "expense_id": matched_ids["expense_id"],
-            "missing_transaction": not matched,
-            "action": "matched" if matched else "missing_transaction",
-            "reason": f"Matched with {match_type.title()} {matched_ref}" if matched and match_type else "No matching accounting entry found"
+            "add_invoice": add_invoice,
+            "add_expense": add_expense,
+            "add_capital": add_capital,
+            "invoice_id": matched_ids.get("invoice_id"),
+            "expense_id": matched_ids.get("expense_id"),
+            "capital_id": matched_ids.get("capital_id"),
+            "upi_matched": upi_match is not None,
+            "upi_reference": upi_match.get("transaction_id") if upi_match else None,
+            "status": status,
+            "action": action,
+            "action_label": "Add Expense" if add_expense else "Add Invoice" if add_invoice else "Add Capital" if add_capital else "None"
         }
-
-        # Suggest action for unmatched transactions
-        if not matched:
-            if is_credit:
-                result_entry["add_invoice"] = True
-                result_entry["action"] = "add_invoice"
-                result_entry["reason"] = f"Unmatched credit of {amount} - consider adding invoice"
-            elif is_debit:
-                result_entry["add_expense"] = True
-                result_entry["action"] = "add_expense"
-                result_entry["reason"] = f"Unmatched debit of {amount} - consider adding expense"
 
         result.append(result_entry)
 
-    return result
+    matched_accounting = []
+    unmatched_accounting = []
+    
+    for entry in all_accounting_entries:
+        is_bank_matched = entry.get("bank_matched", False)
+        
+        upi_match = None
+        if upi_transactions:
+            entry_date_only = entry['date'].split()[0] if entry['date'] else ""
+            upi_key = f"{entry_date_only}_{entry['amount']:.2f}"
+            if upi_key in upi_amount_date_lookup:
+                for upi_tx in upi_amount_date_lookup[upi_key]:
+                    upi_type = str(upi_tx.get("type", "")).strip().lower()
+                    entry_type = entry["type"]
+                    if (entry_type in ["invoice", "capital"] and "credit" in upi_type) or \
+                       (entry_type == "expense" and "debit" in upi_type):
+                        upi_match = upi_tx
+                        break
+        
+        payment_mode = entry.get("payment_mode", "").lower()
+        is_cash = payment_mode == "cash"
+        
+        if is_bank_matched:
+            action = "none"
+            status = "Matched"
+            remark = ""
+        else:
+            if is_cash:
+                action = "remark"
+                status = "Cash Transaction"
+                remark = "Cash transaction - not reflected in bank statement"
+            else:
+                action = "add_to_bank"
+                status = "Pending"
+                remark = ""
+        
+        accounting_entry = {
+            "date": entry["date"],
+            "description": entry["original"].get("particular", ""),
+            "party_customer_vendor": entry["original"].get("party_customer_vendor", ""),
+            "amount": entry["amount"],
+            "type": entry["type"],
+            "ref_no": entry["ref_no"],
+            "payment_mode": entry.get("payment_mode", ""),
+            "matched": is_bank_matched,
+            "status": status,
+            "action": action,
+            "action_label": "Cash - Not in Bank" if is_cash and not is_bank_matched else "Add to Bank" if not is_cash and not is_bank_matched else "None",
+            "remark": remark,
+            "invoice_id": entry["ids"].get("invoice_id"),
+            "expense_id": entry["ids"].get("expense_id"),
+            "capital_id": entry["ids"].get("capital_id"),
+            "upi_matched": upi_match is not None,
+            "upi_reference": upi_match.get("transaction_id") if upi_match else None
+        }
+        
+        if is_bank_matched:
+            matched_accounting.append(accounting_entry)
+        else:
+            unmatched_accounting.append(accounting_entry)
+
+    return {
+        "matched": result,
+        "matched_accounting": matched_accounting,
+        "unmatched_accounting": unmatched_accounting
+    }

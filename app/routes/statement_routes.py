@@ -60,13 +60,11 @@ async def upload_statement(
     upi_file_path = None
 
     try:
-        # ---------------- SAVE BANK FILE ----------------
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         await file.close()
 
-        # ---------------- SAVE UPI FILE IF PROVIDED ----------------
         if upi_file is not None and getattr(upi_file, "filename", None):
             upi_ext = os.path.splitext(upi_file.filename)[1].lower()
             if upi_ext not in ALLOWED_EXTENSIONS:
@@ -77,7 +75,6 @@ async def upload_statement(
                 shutil.copyfileobj(upi_file.file, buffer)
             await upi_file.close()
 
-        # ---------------- PARSE BANK STATEMENT ----------------
         result = StatementParser.extract_transactions(file_path)
         transactions = result.get("transactions", [])
 
@@ -87,7 +84,6 @@ async def upload_statement(
             tx["credit"] = safe_float(tx.get("credit"))
             valid_transactions.append(tx)
 
-        # ---------------- PARSE UPI STATEMENT ----------------
         upi_transactions = []
         upi_error = None
         if upi_file_path:
@@ -96,7 +92,6 @@ async def upload_statement(
             if not upi_result.get("success"):
                 upi_error = upi_result.get("error")
 
-        # ---------------- PARSE ACCOUNTING JSON ----------------
         try:
             accounting_payload = json.loads(accounting_json)
         except json.JSONDecodeError:
@@ -109,72 +104,92 @@ async def upload_statement(
             if isinstance(accounting_payload, list)
             else []
         )
-        print(f"Received accounting records for reconciliation. - statement_routes.py:112", valid_transactions)
-        # ---------------- RECONCILIATION ----------------
-        reconciliation = reconcile_transactions(valid_transactions, accounting_data)
+        
+        reconciliation_result = reconcile_transactions(
+            valid_transactions, 
+            accounting_data,
+            upi_transactions
+        )
+        
+        matched_items = reconciliation_result["matched"]
+        matched_accounting = reconciliation_result["matched_accounting"]
+        unmatched_accounting = reconciliation_result["unmatched_accounting"]
+        
         bank_upi_reconciliation = reconcile_bank_and_upi(
             valid_transactions,
             upi_transactions,
             accounting_data
         )
 
-        # ---------------- COUNTS ----------------
-        matched_count = sum(1 for x in reconciliation if x["matched"])
-        unmatched_count = len(reconciliation) - matched_count
+        matched_count = sum(1 for x in matched_items if x["matched"])
+        unmatched_count = len(matched_items) - matched_count
+        
+        matched_accounting_count = len(matched_accounting)
+        unmatched_accounting_count = len(unmatched_accounting)
 
         matched_invoice_count = sum(
-            1 for x in reconciliation if x.get("match_type") == "invoice"
+            1 for x in matched_items if x.get("match_type") == "invoice"
         )
 
         matched_expense_count = sum(
-            1 for x in reconciliation if x.get("match_type") == "expense"
+            1 for x in matched_items if x.get("match_type") == "expense"
         )
 
         matched_capital_count = sum(
-            1 for x in reconciliation if x.get("match_type") == "capital"
+            1 for x in matched_items if x.get("match_type") == "capital"
         )
 
-        # ---------------- CAPITAL FIX ----------------
-        total_capital = sum(
-            1 for x in accounting_data
-            if str(x.get("type", "")).strip().lower() == "capital"
-        )
-
-        missing_capital_count = max(0, total_capital - matched_capital_count)
-
-        missing_invoice_count = sum(1 for x in reconciliation if x.get("add_invoice"))
-        missing_expense_count = sum(1 for x in reconciliation if x.get("add_expense"))
-
-        # ---------------- RESPONSE ----------------
         return JSONResponse({
-            "success": True,
+            "success": "true",
             "filename": file.filename,
             "total_records": len(valid_transactions),
 
-            "detected_columns": result.get("detected_columns", result.get("schema", {})),
+            "detected_columns": result.get(
+                "detected_columns",
+                result.get("schema", {})
+            ),
 
             "transactions": valid_transactions,
-            "upi_file": upi_file.filename if upi_file is not None and getattr(upi_file, "filename", None) else None,
+
+            "upi_file": (
+                upi_file.filename
+                if upi_file is not None and getattr(upi_file, "filename", None)
+                else None
+            ),
+
             "upi_transactions": upi_transactions,
             "upi_error": upi_error,
-            "missing_data": bank_upi_reconciliation.get("upi_missing_in_bank", []),
-            "remarks": bank_upi_reconciliation.get("remarks", []),
 
-            "reconciliation": {
-                "matched_count": matched_count,
-                "unmatched_count": unmatched_count,
-
+            "reconciliation_summary": {
+                "total_bank_transactions": len(valid_transactions),
+                "reconciled": matched_count,
+                "pending_review": unmatched_count,
+                "accounting_matched": matched_accounting_count,
+                "accounting_pending": unmatched_accounting_count,
                 "matched_invoice_count": matched_invoice_count,
                 "matched_expense_count": matched_expense_count,
                 "matched_capital_count": matched_capital_count,
-
-                "missing_invoice_count": missing_invoice_count,
-                "missing_expense_count": missing_expense_count,
-                "missing_capital_count": missing_capital_count,
-
-                "items": reconciliation
+                "upi_matched": bank_upi_reconciliation.get("matched_count", 0),
+                "upi_pending": bank_upi_reconciliation.get("missing_count", 0),
             },
-            "bank_upi_reconciliation": bank_upi_reconciliation
+
+            "matched_items": [
+                x for x in matched_items if x["matched"]
+            ],
+
+            "unmatched_items": [
+                x for x in matched_items if not x["matched"]
+            ],
+
+            "matched_accounting": matched_accounting,
+            "unmatched_accounting": unmatched_accounting,
+
+            "bank_upi_reconciliation": {
+                "matched_items": bank_upi_reconciliation.get("matched_items", []),
+                "upi_missing_in_bank": bank_upi_reconciliation.get("upi_missing_in_bank", []),
+                "bank_non_upi_transactions": bank_upi_reconciliation.get("bank_non_upi_transactions", []),
+                "remarks": bank_upi_reconciliation.get("remarks", [])
+            }
         })
 
     except Exception as e:
